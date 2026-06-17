@@ -251,9 +251,6 @@ def check_encryptly_runs(timeout: int = 600) -> tuple[bool, str]:
             text=True,
             timeout=timeout,
         )
-        # if result.returncode != 0:
-        #     output = result.stderr.strip() or result.stdout.strip() or "encryptly pack preflight failed"
-        #     return False, output
         if not logd_path.exists():
             return False, "encryptly preflight completed without creating a .logd"
         return True, "encryptly preflight passed"
@@ -320,8 +317,10 @@ def build_module(
         if not node_modules.exists():
             print(f"       {color('npm install...', Colors.GRAY)}")
             try:
+                # Windows fix: resolve npm.cmd path safely
+                npm_bin = shutil.which("npm") or "npm"
                 install_result = subprocess.run(
-                    ["npm", "install"],
+                    [npm_bin, "install"],
                     cwd=str(module.dir),
                     capture_output=not verbose,
                     text=True,
@@ -332,13 +331,16 @@ def build_module(
                     return False, time.time() - start, f"npm install failed:\n{install_result.stderr}"
             except subprocess.TimeoutExpired:
                 return False, time.time() - start, "npm install TIMEOUT (120s)"
+            except FileNotFoundError as e:
+                # This catches the crash when Node.js isn't installed
+                return False, time.time() - start, f"Command not found: {e}"
 
     if module.name == "engine":
-
         build_type = "Release" if release else "Debug"
         try:
+            cmake_bin = shutil.which("cmake") or "cmake"
             cfg_result = subprocess.run(
-                ["cmake", "-S", ".", "-B", "build",
+                [cmake_bin, "-S", ".", "-B", "build",
                  f"-DCMAKE_BUILD_TYPE={build_type}"],
                 cwd=str(module.dir),
                 capture_output=True,
@@ -350,6 +352,7 @@ def build_module(
             return False, time.time() - start, "CMake configure TIMEOUT (120s)"
         except FileNotFoundError as e:
             return False, 0, f"Command not found: {e}"
+            
         if cfg_result.returncode != 0:
             output_lines = []
             if cfg_result.stdout:
@@ -361,12 +364,15 @@ def build_module(
                 f"CMake configure failed:\n{output}")
         if verbose:
             print(f"       {color('cmake configured', Colors.GRAY)}")
-        cmd = ["cmake", "--build", "build"]
+        
+        cmd = [shutil.which("cmake") or "cmake", "--build", "build"]
         if release:
             cmd.append("--config")
             cmd.append("Release")
     else:
         cmd = list(module.build_cmd)
+        # Windows fix: resolve cargo, go, etc.
+        cmd[0] = shutil.which(cmd[0]) or cmd[0]
         if release and module.name == "backend":
             cmd.append("--release")
 
@@ -734,11 +740,11 @@ def generate_logd(
         if safe_pw:
             print()
             print(f"  {color('Password', Colors.BOLD)} - this is required to decrypt the diagnostic log,")
-            print(f"             which is required to submit a PR. Upload the")
-            print(f"             diagnostic log file(s) and metadata file with this password.")
+            print(f"            which is required to submit a PR. Upload the")
+            print(f"            diagnostic log file(s) and metadata file with this password.")
             if len(logd_files) > 1:
-                print(f"             Reassemble chunks in order before unpacking:")
-                print(f"             cat {' '.join(logd_relpaths)} > {logd_path.relative_to(ROOT)}")
+                print(f"            Reassemble chunks in order before unpacking:")
+                print(f"            cat {' '.join(logd_relpaths)} > {logd_path.relative_to(ROOT)}")
             print(f"  {color(safe_pw, Colors.CYAN)}")
             print(f"  {color(f'encryptly unpack {decrypt_target} <outdir> --password {safe_pw}', Colors.GRAY)}")
         return True
@@ -782,37 +788,65 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 build.py                    Build all modules
-  python3 build.py -m backend         Build only backend
-  python3 build.py -m frontend,market Build frontend and market
-  python3 build.py --clean            Clean all artifacts
-  python3 build.py --release          Release build (Rust only)
-  python3 build.py --verbose          Verbose output
-
-Diagnostic bundle:
-  python3 build.py
+  python3 build.py                          # Build all modules (default behavior)
+  python3 build.py -t backend,frontend      # Build specific targets only
+  python3 build.py -t market --skip-diagnostics # Fast rebuild, skipping diagnostic logs
+  python3 build.py -vvv -o ./dist           # Max verbosity, export artifacts to ./dist
+  python3 build.py --clean                  # Clean all artifacts
         """,
     )
+    
     parser.add_argument(
-        "-m", "--module",
-        help="Module(s) to build (comma-separated, or 'all')",
-        default="all",
+        "--version", 
+        action="version", 
+        version="build.py version 1.1.0",
+        help="Print build.py version and exit"
     )
+    
     parser.add_argument(
-        "--clean", action="store_true",
+        "--list-targets", "--list", 
+        action="store_true", 
+        dest="list_targets",
+        help="List all discoverable build targets with descriptions and exit",
+    )
+    
+    parser.add_argument(
+        "-t", "--target", "-m", "--module",
+        dest="target",
+        help="Comma-separated list of modules to build (e.g., backend,frontend,market)",
+    )
+    
+    parser.add_argument(
+        "--skip-diagnostics", 
+        action="store_true",
+        help="Skip diagnostic log generation for faster iteration",
+    )
+    
+    parser.add_argument(
+        "-v", "--verbose", 
+        action="count", 
+        default=0,
+        help="Increase log verbosity (can be specified multiple times: -v, -vv, -vvv)",
+    )
+    
+    parser.add_argument(
+        "-o", "--output-dir", 
+        type=str, 
+        dest="output_dir",
+        help="Custom output directory for build artifacts",
+    )
+
+    # Legacy flags preserved to ensure 100% identical default / CI behavior
+    parser.add_argument(
+        "--clean", 
+        action="store_true",
         help="Clean build artifacts instead of building",
     )
+    
     parser.add_argument(
-        "--release", action="store_true",
-        help="Build in release mode (Rust backend)",
-    )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true",
-        help="Show detailed build output",
-    )
-    parser.add_argument(
-        "--list", action="store_true",
-        help="List available modules and exit",
+        "--release", 
+        action="store_true",
+        help="Build in release mode (Rust backend only)",
     )
 
     args = parser.parse_args()
@@ -821,12 +855,11 @@ Diagnostic bundle:
     print(f"  Working directory: {ROOT}")
     print()
 
-    if args.list:
-        print(f"  {color('Available modules:', Colors.BOLD)}")
+    if args.list_targets:
+        print(f"  {color('Available Build Targets:', Colors.BOLD)}")
         for m in MODULES:
-            print(f"    {color(m.name, Colors.CYAN)} ({m.language})")
-            print(f"      dir: {m.dir.relative_to(ROOT)}")
-            print(f"      build: {' '.join(m.build_cmd)}")
+            desc = f"Builds the {m.language} module in {m.dir.relative_to(ROOT)}"
+            print(f"    {color(m.name, Colors.CYAN):<25} - {desc}")
         return 0
 
     print(f"  {color('Checking prerequisites...', Colors.GRAY)}")
@@ -840,16 +873,20 @@ Diagnostic bundle:
         print(f"  {color(msg, Colors.GRAY)}")
     else:
         print(f"  {color('✓ All prerequisites found', Colors.GREEN)}")
-    if args.module == "all":
+
+    if args.target is None or args.target.strip() == "all":
         selected = MODULES
     else:
-        names = [n.strip() for n in args.module.split(",")]
-        selected = [m for m in MODULES if m.name in names]
-        not_found = set(names) - {m.name for m in MODULES}
-        if not_found:
-            print(f"  {color('✗ Unknown modules:', Colors.RED)} {', '.join(not_found)}")
-            print(f"    Available: {', '.join(m.name for m in MODULES)}")
+        names = [n.strip() for n in args.target.split(",")]
+        valid_map = {m.name: m for m in MODULES}
+        
+        unknown = [n for n in names if n not in valid_map]
+        if unknown:
+            print(f"  {color('ERROR: Unknown target(s):', Colors.RED)} {', '.join(unknown)}")
+            print(f"  {color('Valid targets are:', Colors.GRAY)} {', '.join(valid_map.keys())}")
             return 1
+            
+        selected = [valid_map[n] for n in names]
 
     if not selected:
         print(f"  No modules selected.")
@@ -858,7 +895,7 @@ Diagnostic bundle:
     if args.clean:
         print(f"\n  {color('Cleaning build artifacts...', Colors.YELLOW)}")
         for module in selected:
-            clean_module(module, args.verbose)
+            clean_module(module, args.verbose > 0)
 
         diagnostic_artifacts = [ROOT / "build.logd"]
         if DIAGNOSTIC_DIR.exists():
@@ -876,33 +913,61 @@ Diagnostic bundle:
         print(f"\n  {color('Clean complete.', Colors.GREEN)}")
         return 0
 
-    print(f"\n  {color('Checking encryptly diagnostics...', Colors.GRAY)}")
-    encryptly_start = time.time()
-    encryptly_ok, encryptly_message = check_encryptly_runs()
-    if not encryptly_ok:
-        elapsed = time.time() - encryptly_start
-        blocker = f"{ENCRYPTLY_BLOCKER_MESSAGE} {encryptly_message}"
-        print(f"  {color('✗ encryptly cannot run', Colors.RED)}")
-        print(f"  {color('BLOCKER:', Colors.RED)} {blocker}")
-        results = [("encryptly-preflight", False, elapsed, blocker, None)]
-        generate_logd(results, args.verbose)
-        return 1
-    print(f"  {color('✓ encryptly runs', Colors.GREEN)}")
+    if not args.skip_diagnostics:
+        print(f"\n  {color('Checking encryptly diagnostics...', Colors.GRAY)}")
+        encryptly_start = time.time()
+        encryptly_ok, encryptly_message = check_encryptly_runs()
+        if not encryptly_ok:
+            elapsed = time.time() - encryptly_start
+            blocker = f"{ENCRYPTLY_BLOCKER_MESSAGE} {encryptly_message}"
+            print(f"  {color('✗ encryptly cannot run', Colors.RED)}")
+            print(f"  {color('BLOCKER:', Colors.RED)} {blocker}")
+            results = [("encryptly-preflight", False, elapsed, blocker, None)]
+            generate_logd(results, args.verbose > 0)
+            return 1
+        print(f"  {color('✓ encryptly runs', Colors.GREEN)}")
+    else:
+        print(f"\n  {color('Skipping diagnostic preflight (--skip-diagnostics set)', Colors.GRAY)}")
 
     print(f"\n  {color(f'Building {len(selected)} module(s) | release={args.release}', Colors.GRAY)}")
 
     results: list[tuple[str, bool, float, str, Optional[str]]] = []
 
+    out_dir_path = None
+    if args.output_dir:
+        out_dir_path = Path(args.output_dir).resolve()
+        out_dir_path.mkdir(parents=True, exist_ok=True)
+        print(f"  {color(f'Custom output directory set to: {out_dir_path}', Colors.GRAY)}")
+
     for module in selected:
-        success, elapsed, output = build_module(module, args.release, args.verbose)
+        success, elapsed, output = build_module(module, args.release, args.verbose > 0)
         binary = verify_binary(module) if success else None
+        
+        # Safely copy binary artifact if a custom output directory is provided
+        if success and binary and out_dir_path:
+            try:
+                bin_path = Path(binary)
+                if bin_path.is_file():
+                    shutil.copy2(bin_path, out_dir_path / bin_path.name)
+                elif bin_path.is_dir():
+                    dest = out_dir_path / bin_path.name
+                    if dest.exists():
+                        shutil.rmtree(dest)
+                    shutil.copytree(bin_path, dest)
+                print(f"       {color(f'Exported artifact to: {out_dir_path / bin_path.name}', Colors.GREEN)}")
+            except Exception as e:
+                print(f"       {color(f'Failed to copy artifact {binary}: {e}', Colors.RED)}")
+
         results.append((module.name, success, elapsed, output, binary))
 
     print_summary(results)
 
-    diagnostics_ok = generate_logd(results, args.verbose)
-
-    return 0 if diagnostics_ok and all(r[1] for r in results) else 1
+    if not args.skip_diagnostics:
+        diagnostics_ok = generate_logd(results, args.verbose > 0)
+        return 0 if diagnostics_ok and all(r[1] for r in results) else 1
+    else:
+        print(f"\n  {color('Skipping logd generation (--skip-diagnostics set)', Colors.GRAY)}")
+        return 0 if all(r[1] for r in results) else 1
 
 if __name__ == "__main__":
     sys.exit(main())
